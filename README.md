@@ -1,5 +1,8 @@
 # aw-import-screentime
 
+- [ ] de-duplication of `aw-import-screentime events import` (credit to [zetavg/aw-import-screentime@dd4b32d](https://github.com/zetavg/aw-import-screentime/commit/dd4b32d772682df52c0f1575cfef86c237549f28))
+- [ ] add macos support via screentime data in `knowledgeC.db`
+
 Import Apple's Screen Time App.InFocus telemetry (stored in Biome `SEGB` files) into [ActivityWatch](https://activitywatch.net) buckets. All CLI commands emit JSON to stdout so you can easily pipe the results into `jq`, persist them, or feed them to other tools.
 
 ## What you get

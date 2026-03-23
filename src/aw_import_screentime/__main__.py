@@ -201,17 +201,53 @@ class ActivityWatchSink:
 
     def emit(self, bucket: str, events: Sequence[Event]) -> int:
         """
-        Insert events into the given ActivityWatch bucket.
+        Insert events into the given ActivityWatch bucket, skipping duplicates.
+
+        Queries the server for existing events in the time range first,
+        then only inserts events whose (timestamp, duration, app) key
+        is not already present.
 
         Returns:
-            The number of events inserted.
+            The number of new events inserted.
         """
         if not events:
             return 0
-        # Insert all events in a single call (explicit list to avoid generator reuse).
-        self.client.insert_events(bucket, list(events))
-        logger.info("Inserted %d events into %s", len(events), bucket)
-        return len(events)
+
+        # Determine the time range spanned by the new events.
+        start = min(e.timestamp for e in events)
+        end = max(e.timestamp + (e.duration or timedelta(0)) for e in events)
+
+        # Fetch existing events in that range from the server.
+        existing = self.client.get_events(bucket, start=start, end=end, limit=-1)
+        existing_keys: set[tuple[datetime, timedelta | None, str | None]] = {
+            (e.timestamp, e.duration, e.data.get("app") if isinstance(e.data, dict) else None)
+            for e in existing
+        }
+
+        new_events = [
+            e
+            for e in events
+            if (e.timestamp, e.duration, e.data.get("app") if isinstance(e.data, dict) else None)
+            not in existing_keys
+        ]
+
+        if not new_events:
+            logger.info(
+                "No new events to insert into %s (all %d already exist)",
+                bucket,
+                len(events),
+            )
+            return 0
+
+        self.client.insert_events(bucket, new_events)
+        skipped = len(events) - len(new_events)
+        logger.info(
+            "Inserted %d new events into %s (%d skipped as duplicates)",
+            len(new_events),
+            bucket,
+            skipped,
+        )
+        return len(new_events)
 
 
 class NullSink:
@@ -539,6 +575,8 @@ class RawEventItem(TypedDict):
 app = typer.Typer(add_completion=False, no_args_is_help=True)
 events_app = typer.Typer(no_args_is_help=True)
 app.add_typer(events_app, name="events")
+macos_app = typer.Typer(no_args_is_help=True)
+app.add_typer(macos_app, name="macos")
 
 
 @app.callback()
@@ -800,6 +838,134 @@ def cmd_file(
                 for ev in view
             ],
         }
+    )
+
+
+# --------------------------------------------------------------------------------------
+# macOS CLI (knowledgeC.db)
+# --------------------------------------------------------------------------------------
+
+
+@macos_app.command("preview")
+def cmd_macos_preview(
+    ctx: typer.Context,
+    since: Optional[str] = typer.Option(
+        None, "--since", help="ISO-8601 or relative (e.g., 24h, 2h, yesterday)"
+    ),
+    storefront: Optional[list[str]] = typer.Option(
+        None, "--storefront", help="App Store storefront(s) (repeatable; order matters)"
+    ),
+) -> None:
+    """
+    Preview macOS app usage events from knowledgeC.db (read-only).
+    """
+    from aw_import_screentime.macos_knowledgec import build_macos_events, knowledgec_db_path
+
+    tzinfo: dt_tzinfo = ctx.obj["tzinfo"]
+    since_dt = parse_since(since, tzinfo=tzinfo)
+    storefronts = resolve_storefronts(storefront)
+
+    db_path = knowledgec_db_path()
+    if not db_path.exists():
+        logger.error("knowledgeC.db not found at %s", db_path)
+        raise typer.Exit(1)
+
+    events = build_macos_events(tzinfo=tzinfo, since=since_dt, storefronts=storefronts)
+    emit_json(
+        [
+            {
+                "source": str(db_path),
+                "events": [
+                    {
+                        "timestamp": ev.timestamp.isoformat(),
+                        "duration_seconds": ev.duration.total_seconds() if ev.duration else None,
+                        "data": dict(ev.data),
+                    }
+                    for ev in events
+                ],
+            }
+        ]
+    )
+
+
+@macos_app.command("import")
+def cmd_macos_import(
+    ctx: typer.Context,
+    since: Optional[str] = typer.Option(
+        None, "--since", help="ISO-8601 or relative (e.g., 24h, 2h, yesterday)"
+    ),
+    storefront: Optional[list[str]] = typer.Option(
+        None, "--storefront", help="App Store storefront(s) (repeatable; order matters)"
+    ),
+    bucket_suffix: Optional[str] = typer.Option(
+        None, "--bucket-suffix", help="Append suffix to ActivityWatch bucket ID"
+    ),
+    testing: bool = typer.Option(
+        False,
+        "--testing/--no-testing",
+        help="Connect to aw-server testing instance (port 5666)",
+    ),
+    port: Optional[int] = typer.Option(
+        None,
+        "--port",
+        help="Override aw-server port (works in testing or normal modes)",
+    ),
+) -> None:
+    """
+    Import macOS app usage events from knowledgeC.db into ActivityWatch.
+    """
+    import socket
+
+    from aw_import_screentime.macos_knowledgec import build_macos_events, knowledgec_db_path
+
+    tzinfo: dt_tzinfo = ctx.obj["tzinfo"]
+    since_dt = parse_since(since, tzinfo=tzinfo)
+    storefronts = resolve_storefronts(storefront)
+
+    db_path = knowledgec_db_path()
+    if not db_path.exists():
+        logger.error("knowledgeC.db not found at %s", db_path)
+        raise typer.Exit(1)
+
+    client_kwargs: dict[str, object] = {"client_name": "aw-import-screentime"}
+    if testing:
+        client_kwargs["testing"] = True
+    if port is not None:
+        client_kwargs["port"] = port
+    try:
+        client = ActivityWatchClient(**client_kwargs)  # type: ignore[arg-type]
+        logger.info("ActivityWatch client initialized")
+    except TypeError as exc:
+        raise typer.BadParameter(f"ActivityWatchClient init failed: {exc}") from exc
+
+    hostname = socket.gethostname()
+    sink = ActivityWatchSink(client, bucket_suffix=bucket_suffix)
+
+    # Override bucket id for macOS source
+    base_bucket = f"aw-import-screentime_macos_{hostname}"
+    bucket_id = f"{base_bucket}_{bucket_suffix}" if bucket_suffix else base_bucket
+    try:
+        client.create_bucket(bucket_id, "app")
+        logger.info("Ensured bucket %s", bucket_id)
+    except requests.RequestException as exc:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if status not in (304, 409):
+            raise
+        logger.debug("Bucket %s already exists (status=%s)", bucket_id, status)
+
+    events = build_macos_events(tzinfo=tzinfo, since=since_dt, storefronts=storefronts)
+    emitted = sink.emit(bucket_id, events)
+
+    emit_json(
+        [
+            {
+                "source": str(db_path),
+                "bucket_id": bucket_id,
+                "events_emitted": emitted,
+                "first_timestamp": events[0].timestamp.isoformat() if emitted else None,
+                "last_timestamp": events[-1].timestamp.isoformat() if emitted else None,
+            }
+        ]
     )
 
 
