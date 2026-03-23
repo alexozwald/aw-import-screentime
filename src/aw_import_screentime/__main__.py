@@ -842,13 +842,14 @@ def cmd_file(
 
 
 # --------------------------------------------------------------------------------------
-# macOS CLI (knowledgeC.db)
+# macOS CLI (App.InFocus/local/ SEGB)
 # --------------------------------------------------------------------------------------
 
 
 @macos_app.command("preview")
 def cmd_macos_preview(
     ctx: typer.Context,
+    limit: int = typer.Option(5, "--limit", "-n", help="Files to read (0 = all)"),
     since: Optional[str] = typer.Option(
         None, "--since", help="ISO-8601 or relative (e.g., 24h, 2h, yesterday)"
     ),
@@ -857,24 +858,24 @@ def cmd_macos_preview(
     ),
 ) -> None:
     """
-    Preview macOS app usage events from knowledgeC.db (read-only).
+    Preview macOS app usage events from App.InFocus/local/ SEGB files (read-only).
     """
-    from aw_import_screentime.macos_knowledgec import build_macos_events, knowledgec_db_path
+    from aw_import_screentime.macos import get_mac_device_id, tail_local_files
 
     tzinfo: dt_tzinfo = ctx.obj["tzinfo"]
     since_dt = parse_since(since, tzinfo=tzinfo)
     storefronts = resolve_storefronts(storefront)
 
-    db_path = knowledgec_db_path()
-    if not db_path.exists():
-        logger.error("knowledgeC.db not found at %s", db_path)
-        raise typer.Exit(1)
-
-    events = build_macos_events(tzinfo=tzinfo, since=since_dt, storefronts=storefronts)
+    device_id = get_mac_device_id(sync_db_path()) or "mac-local"
+    files = tail_local_files(limit=limit)
+    events = build_stitched_events_for_files(
+        files, tzinfo=tzinfo, since=since_dt, storefronts=storefronts
+    )
     emit_json(
         [
             {
-                "source": str(db_path),
+                "device_id": device_id,
+                "files_scanned": len(files),
                 "events": [
                     {
                         "timestamp": ev.timestamp.isoformat(),
@@ -891,6 +892,7 @@ def cmd_macos_preview(
 @macos_app.command("import")
 def cmd_macos_import(
     ctx: typer.Context,
+    limit: int = typer.Option(5, "--limit", "-n", help="Files to read (0 = all)"),
     since: Optional[str] = typer.Option(
         None, "--since", help="ISO-8601 or relative (e.g., 24h, 2h, yesterday)"
     ),
@@ -912,20 +914,17 @@ def cmd_macos_import(
     ),
 ) -> None:
     """
-    Import macOS app usage events from knowledgeC.db into ActivityWatch.
+    Import macOS app usage events from App.InFocus/local/ SEGB files into ActivityWatch.
     """
-    import socket
-
-    from aw_import_screentime.macos_knowledgec import build_macos_events, knowledgec_db_path
+    from aw_import_screentime.macos import get_mac_device_id, tail_local_files
 
     tzinfo: dt_tzinfo = ctx.obj["tzinfo"]
     since_dt = parse_since(since, tzinfo=tzinfo)
     storefronts = resolve_storefronts(storefront)
 
-    db_path = knowledgec_db_path()
-    if not db_path.exists():
-        logger.error("knowledgeC.db not found at %s", db_path)
-        raise typer.Exit(1)
+    device_id = get_mac_device_id(sync_db_path()) or "mac-local"
+    base_bucket = f"aw-import-screentime_macos_{device_id}"
+    bucket_id = f"{base_bucket}_{bucket_suffix}" if bucket_suffix else base_bucket
 
     client_kwargs: dict[str, object] = {"client_name": "aw-import-screentime"}
     if testing:
@@ -938,12 +937,6 @@ def cmd_macos_import(
     except TypeError as exc:
         raise typer.BadParameter(f"ActivityWatchClient init failed: {exc}") from exc
 
-    hostname = socket.gethostname()
-    sink = ActivityWatchSink(client, bucket_suffix=bucket_suffix)
-
-    # Override bucket id for macOS source
-    base_bucket = f"aw-import-screentime_macos_{hostname}"
-    bucket_id = f"{base_bucket}_{bucket_suffix}" if bucket_suffix else base_bucket
     try:
         client.create_bucket(bucket_id, "app")
         logger.info("Ensured bucket %s", bucket_id)
@@ -953,13 +946,18 @@ def cmd_macos_import(
             raise
         logger.debug("Bucket %s already exists (status=%s)", bucket_id, status)
 
-    events = build_macos_events(tzinfo=tzinfo, since=since_dt, storefronts=storefronts)
+    sink = ActivityWatchSink(client, bucket_suffix=None)  # bucket_suffix already baked in
+    files = tail_local_files(limit=limit)
+    events = build_stitched_events_for_files(
+        files, tzinfo=tzinfo, since=since_dt, storefronts=storefronts
+    )
     emitted = sink.emit(bucket_id, events)
 
     emit_json(
         [
             {
-                "source": str(db_path),
+                "device_id": device_id,
+                "files_scanned": len(files),
                 "bucket_id": bucket_id,
                 "events_emitted": emitted,
                 "first_timestamp": events[0].timestamp.isoformat() if emitted else None,
