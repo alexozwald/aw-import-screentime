@@ -866,7 +866,8 @@ def cmd_macos_preview(
     since_dt = parse_since(since, tzinfo=tzinfo)
     storefronts = resolve_storefronts(storefront)
 
-    device_id = get_mac_device_id(sync_db_path()) or "mac-local"
+    raw_device_id = get_mac_device_id(sync_db_path())
+    device_id = f"mac-{raw_device_id}" if raw_device_id else "mac-local"
     files = tail_local_files(limit=limit)
     events = build_stitched_events_for_files(
         files, tzinfo=tzinfo, since=since_dt, storefronts=storefronts
@@ -922,7 +923,8 @@ def cmd_macos_import(
     since_dt = parse_since(since, tzinfo=tzinfo)
     storefronts = resolve_storefronts(storefront)
 
-    device_id = get_mac_device_id(sync_db_path()) or "mac-local"
+    raw_device_id = get_mac_device_id(sync_db_path())
+    device_id = f"mac-{raw_device_id}" if raw_device_id else "mac-local"
     base_bucket = f"aw-import-screentime_macos_{device_id}"
     bucket_id = f"{base_bucket}_{bucket_suffix}" if bucket_suffix else base_bucket
 
@@ -933,6 +935,7 @@ def cmd_macos_import(
         client_kwargs["port"] = port
     try:
         client = ActivityWatchClient(**client_kwargs)  # type: ignore[arg-type]
+        client.client_hostname = device_id
         logger.info("ActivityWatch client initialized")
     except TypeError as exc:
         raise typer.BadParameter(f"ActivityWatchClient init failed: {exc}") from exc
